@@ -86,13 +86,6 @@ resource "google_project" "main" {
     ]
   }
 
-  dynamic "org_id" {
-    for_each = local.project_org_id != null ? [1] : []
-    content {
-      org_id = local.project_org_id
-    }
-  }
-
 }
 
 /******************************************
