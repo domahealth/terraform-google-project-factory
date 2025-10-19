@@ -82,7 +82,6 @@ resource "google_project" "main" {
 
   lifecycle {
     ignore_changes = [
-      org_id,
       labels["firebase"],
     ]
   }
