@@ -35,15 +35,8 @@ locals {
   use_random_string = try(var.random_project_id_length > 0, false)
   group_id          = var.manage_group ? format("group:%s", var.group_email) : ""
   base_project_id   = var.project_id == "" ? var.name : var.project_id
-  # project_org_id    = var.folder_id != "" ? null : var.org_id
-  # project_folder_id = var.folder_id != "" ? var.folder_id : null
-
-  org_id_input    = try(trimspace(var.org_id), "")
-  folder_id_input = try(trimspace(var.folder_id), "")
-
-  use_org    = local.org_id_input != "" && local.folder_id_input == ""
-  use_folder = local.folder_id_input != "" && local.org_id_input == ""
-
+  project_org_id    = var.folder_id != "" ? null : var.org_id
+  project_folder_id = var.folder_id != "" ? var.folder_id : null
   temp_project_id = var.random_project_id ? format(
     "%s-%s",
     local.base_project_id,
@@ -55,7 +48,7 @@ locals {
   ) : ""
   api_s_account = format(
     "%s@cloudservices.gserviceaccount.com",
-    data.google_project.main.number,
+    google_project.main.number,
   )
   activate_apis       = var.activate_apis
   api_s_account_fmt   = format("serviceAccount:%s", local.api_s_account)
@@ -74,107 +67,34 @@ locals {
   shared_vpc_users_length = var.create_project_sa ? 3 : 2
 }
 
-
-# Enforce "exactly one of org_id or folder_id" provided
-resource "terraform_data" "assert_one_parent" {
-  lifecycle {
-    precondition {
-      condition     = (local.use_org || local.use_folder) && !(local.use_org && local.use_folder)
-      error_message = "Exactly one of org_id or folder_id must be provided (non-empty)."
-    }
-  }
-}
-
-
-
-# Organization-parented project (org_id set, folder_id omitted)
-resource "google_project" "main_by_org" {
-  count      = local.use_org ? 1 : 0
-
-  name       = var.name
-  project_id = var.project_id
-  deletion_policy     = var.deletion_policy
-
-  org_id     = local.org_id_input
-
+/*******************************************
+  Project creation
+ *******************************************/
+resource "google_project" "main" {
+  name                = var.name
+  project_id          = local.temp_project_id
+  org_id              = local.project_org_id
+  folder_id           = local.project_folder_id
   billing_account     = var.billing_account
   auto_create_network = var.auto_create_network
-  labels              = var.labels
+  deletion_policy     = var.deletion_policy
 
-  depends_on = [terraform_data.assert_one_parent]
+  labels = var.labels
 
   lifecycle {
     ignore_changes = [
-      labels["firebase"],
+      labels,
+      org_id,
     ]
   }
 }
-
-# Folder-parented project (folder_id set, org_id omitted)
-resource "google_project" "main_by_folder" {
-  count      = local.use_folder ? 1 : 0
-
-  name       = var.name
-  project_id = var.project_id
-  deletion_policy     = var.deletion_policy
-
-  folder_id  = local.folder_id_input
-
-  billing_account     = var.billing_account
-  auto_create_network = var.auto_create_network
-  labels              = var.labels
-
-  depends_on = [terraform_data.assert_one_parent]
-
-  lifecycle {
-    ignore_changes = [
-      labels["firebase"],
-    ]
-  }
-}
-
-# Back-compat: expose a google_project.main data source that reflects the created project
-locals {
-  main_project_id = local.use_org ? google_project.main_by_org[0].project_id : google_project.main_by_folder[0].project_id
-}
-
-data "google_project" "main" {
-  project_id = local.main_project_id
-
-  depends_on = [
-    google_project.main_by_org,
-    google_project.main_by_folder,
-  ]
-}
-
-
-# /*******************************************
-#   Project creation
-#  *******************************************/
-# resource "google_project" "main" {
-#   name                = var.name
-#   project_id          = local.temp_project_id
-#   org_id              = trimspace(coalesce(local.project_org_id, "")) == "" ? "" : local.project_org_id
-#   folder_id           = local.project_folder_id
-#   billing_account     = var.billing_account
-#   auto_create_network = var.auto_create_network
-#   deletion_policy     = var.deletion_policy
-#
-#   labels = var.labels
-#
-#   lifecycle {
-#     ignore_changes = [
-#       labels["firebase"],
-#     ]
-#   }
-# }
 
 /******************************************
   Project lien
  *****************************************/
 resource "google_resource_manager_lien" "lien" {
   count        = var.lien ? 1 : 0
-  parent       = "projects/${data.google_project.main.number}"
+  parent       = "projects/${google_project.main.number}"
   restrictions = ["resourcemanager.projects.delete"]
   origin       = "project-factory"
   reason       = "Project Factory lien"
@@ -186,7 +106,7 @@ resource "google_resource_manager_lien" "lien" {
 module "project_services" {
   source = "../project_services"
 
-  project_id                  = data.google_project.main.project_id
+  project_id                  = google_project.main.project_id
   activate_apis               = local.activate_apis
   activate_api_identities     = var.activate_api_identities
   disable_services_on_destroy = var.disable_services_on_destroy
@@ -207,7 +127,7 @@ resource "google_compute_shared_vpc_service_project" "shared_vpc_attachment" {
 
   count           = var.enable_shared_vpc_service_project ? 1 : 0
   host_project    = var.shared_vpc
-  service_project = data.google_project.main.project_id
+  service_project = google_project.main.project_id
   depends_on      = [time_sleep.wait_5_seconds[0], module.project_services]
 }
 
@@ -215,14 +135,14 @@ resource "google_compute_shared_vpc_host_project" "shared_vpc_host" {
   provider = google-beta
 
   count      = var.enable_shared_vpc_host_project ? 1 : 0
-  project    = data.google_project.main.project_id
+  project    = google_project.main.project_id
   depends_on = [module.project_services]
 }
 
 resource "google_project_default_service_accounts" "default_service_accounts" {
   count          = upper(var.default_service_account) == "KEEP" ? 0 : 1
   action         = upper(var.default_service_account)
-  project        = data.google_project.main.project_id
+  project        = google_project.main.project_id
   restore_policy = "REVERT_AND_IGNORE_FAILURE"
   depends_on     = [module.project_services]
 }
@@ -235,7 +155,7 @@ resource "google_service_account" "default_service_account" {
   account_id                   = var.project_sa_name
   display_name                 = "${var.name} Project Service Account"
   description                  = var.project_sa_description
-  project                      = data.google_project.main.project_id
+  project                      = google_project.main.project_id
   create_ignore_already_exists = true
 }
 
@@ -244,7 +164,7 @@ resource "google_service_account" "default_service_account" {
  *************************************************/
 resource "google_project_iam_member" "default_service_account_membership" {
   count   = var.sa_role != "" && var.create_project_sa ? 1 : 0
-  project = data.google_project.main.project_id
+  project = google_project.main.project_id
   role    = var.sa_role
 
   member = local.s_account_fmt
@@ -257,7 +177,7 @@ resource "google_project_iam_member" "gsuite_group_role" {
   count = var.manage_group ? 1 : 0
 
   member  = local.group_id
-  project = data.google_project.main.project_id
+  project = google_project.main.project_id
   role    = var.group_role
 }
 
@@ -270,7 +190,7 @@ resource "google_service_account_iam_member" "service_account_grant_to_group" {
   member = local.group_id
   role   = "roles/iam.serviceAccountUser"
 
-  service_account_id = "projects/${data.google_project.main.project_id}/serviceAccounts/${google_service_account.default_service_account[0].email}"
+  service_account_id = "projects/${google_project.main.project_id}/serviceAccounts/${google_service_account.default_service_account[0].email}"
 }
 
 /******************************************************************************************************************
@@ -367,9 +287,9 @@ resource "google_compute_subnetwork_iam_member" "apis_service_account_role_to_vp
 resource "google_project_usage_export_bucket" "usage_report_export" {
   count = var.usage_bucket_name != "" ? 1 : 0
 
-  project     = data.google_project.main.project_id
+  project     = google_project.main.project_id
   bucket_name = var.usage_bucket_name
-  prefix      = var.usage_bucket_prefix != "" ? var.usage_bucket_prefix : "usage-${data.google_project.main.project_id}"
+  prefix      = var.usage_bucket_prefix != "" ? var.usage_bucket_prefix : "usage-${google_project.main.project_id}"
 
   depends_on = [
     module.project_services,
@@ -385,7 +305,7 @@ resource "google_storage_bucket" "project_bucket" {
   count = local.create_bucket ? 1 : 0
 
   name                        = local.project_bucket_name
-  project                     = var.bucket_project == local.base_project_id ? data.google_project.main.project_id : var.bucket_project
+  project                     = var.bucket_project == local.base_project_id ? google_project.main.project_id : var.bucket_project
   location                    = var.bucket_location
   labels                      = var.bucket_labels
   force_destroy               = var.bucket_force_destroy
@@ -441,7 +361,7 @@ resource "google_access_context_manager_service_perimeter_resource" "service_per
   count          = var.vpc_service_control_attach_enabled ? 1 : 0
   depends_on     = [google_service_account.default_service_account]
   perimeter_name = var.vpc_service_control_perimeter_name
-  resource       = "projects/${data.google_project.main.number}"
+  resource       = "projects/${google_project.main.number}"
 }
 
 /******************************************
@@ -451,7 +371,7 @@ resource "google_access_context_manager_service_perimeter_dry_run_resource" "ser
   count          = var.vpc_service_control_attach_dry_run && !var.vpc_service_control_attach_enabled ? 1 : 0
   depends_on     = [google_service_account.default_service_account]
   perimeter_name = var.vpc_service_control_perimeter_name
-  resource       = "projects/${data.google_project.main.number}"
+  resource       = "projects/${google_project.main.number}"
 }
 
 /******************************************
@@ -459,7 +379,7 @@ resource "google_access_context_manager_service_perimeter_dry_run_resource" "ser
  *****************************************/
 resource "google_project_service" "enable_access_context_manager" {
   count   = var.vpc_service_control_attach_enabled || var.vpc_service_control_attach_dry_run ? 1 : 0
-  project = data.google_project.main.number
+  project = google_project.main.number
   service = "accesscontextmanager.googleapis.com"
 }
 
@@ -468,13 +388,13 @@ resource "google_project_service" "enable_access_context_manager" {
  *****************************************/
 resource "google_compute_project_default_network_tier" "default" {
   count        = var.default_network_tier != "" ? 1 : 0
-  project      = data.google_project.main.number
+  project      = google_project.main.number
   network_tier = var.default_network_tier
 }
 
 resource "google_tags_tag_binding" "bindings" {
   for_each  = toset(var.tag_binding_values)
-  parent    = "//cloudresourcemanager.googleapis.com/projects/${data.google_project.main.number}"
+  parent    = "//cloudresourcemanager.googleapis.com/projects/${google_project.main.number}"
   tag_value = "tagValues/${each.value}"
 }
 
